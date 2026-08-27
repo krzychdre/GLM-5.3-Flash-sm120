@@ -1,4 +1,28 @@
-# GLM-5.3-Flash on 2x NVIDIA DGX Spark
+# GLM-5.3-Flash on SM120 — 4x NVIDIA RTX PRO 6000 Blackwell
+
+**This repo is a fork of the [DGX Spark deployment](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark) (GB10, SM121), re-targeted at SM120: a single x86_64 node with 4x RTX PRO 6000 Blackwell Workstation 96 GB.** The Spark work proved that GLM-5.3-Flash needs seven day-0 fixes across vLLM/FlashInfer on any capability-12 silicon; this fork re-verifies each bug on SM120 with the same probe scripts, ports the patch stack to amd64 (`docker/Dockerfile.glm53-sm120`), and serves the **native FP8 checkpoint** (328 GB — no quantization) instead of NVFP4:
+
+| | this fork (SM120 TP4) | upstream (2x DGX Spark TP2) |
+|---|---|---|
+| Decode / TTFT | **171.7 tok/s / 0.059 s** | 21.8 tok/s / 0.289 s |
+| Weights | zai-org native FP8 | NVFP4 weight-only quant |
+| Context / KV pool | 262K / 1,428,980 fp8 tokens (5.45x) | 262K / 672,606 fp8 tokens |
+| Launcher | `launch-glm53-vllm-sm120-tp4.sh` | `launch-glm53-vllm-tp2.sh` |
+
+Full port report with the bug-by-bug probe results: [docs/SM120-DEPLOY-REPORT.md](docs/SM120-DEPLOY-REPORT.md). Everything below the RTX 6000 section documents the original DGX Spark deployment, kept intact as reference — the root-cause analyses there are what made the sm120 port a same-day job.
+
+## RTX PRO 6000 Blackwell — the hardware this fork targets
+
+- **GB202** (consumer/workstation Blackwell), compute capability **12.0 (sm_120)** — same `major==12` family as the Spark's GB10 (sm_121), which is why the whole sm121 patch stack applies with only `12.1a` → `12.0a` arch-list changes.
+- **96 GB GDDR7 ECC**, 512-bit bus, ~1.8 TB/s bandwidth per card — 4 cards = **384 GB VRAM**, enough to shard the full FP8 checkpoint (76.4 GiB/rank) with ~11 GiB/rank to spare.
+- 24,064 CUDA cores, 5th-gen Tensor Cores with native **FP8 and FP4** — the fp8 KV cache and DeepGEMM fp8 MoE path run on native hardware, no emulation.
+- **No NVLink** — TP4 runs over PCIe Gen5 **P2P**, which is OK-listed and fast on this platform (`nvidia-smi topo -p2p r`); the glm-5.2-sm120 recipe's "P2P must be disabled" did **not** reproduce here.
+- Discrete VRAM (vs GB10's unified memory): vLLM's memory profiling is truthful — no phantom KV allocations, no cache-flush ritual. `--kv-cache-memory` is only used as budget-pinning with vLLM's own "fully utilize" suggestion (10.19 GiB → 1,428,980 fp8 tokens), which is safe here but not feasible on GB10.
+- Measured under decode load: ~90% GPU util, ~300–345 W/card (600 W TBP headroom), ~5 CPU cores host-side (scheduler + NCCL/CUDA spin-wait).
+
+---
+
+# Original project: GLM-5.3-Flash on 2x NVIDIA DGX Spark
 
 Serving [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B total / 18B active MoE, released 2026-08-26) across two DGX Spark (GB10, SM121) nodes at tensor-parallel 2, using the [LibertAIDAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4) weight-only NVFP4 quant. **262,144-token context on TP2 — and up to the model-native 1,048,576 (1M) on TP4, whose 1.26M-token KV pool holds a full 1M-token request. Working, benchmarked, same-day as the model drop.**
 

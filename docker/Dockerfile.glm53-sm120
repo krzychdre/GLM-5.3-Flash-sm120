@@ -1,0 +1,187 @@
+FROM vllm/vllm-openai:glm53-flash
+
+# GLM-5.3-Flash on SM120 (RTX PRO 6000 Blackwell, x86_64) — consolidated port of
+# the sm121 v1..v8 patch stack. Same vLLM commit as the arm64 day-0 image
+# (0.1.dev20051+g487ecf187); every patch keeps its refuse-if-drifted guard.
+#
+# Probed on this hardware (RTX PRO 6000, cap 12.0) before building:
+#  - FlashInfer 0.6.17 FA2 NoPE-MLA: NaN on EVERY batch shape (worse than
+#    sm121, where only 64-256-row batches died) -> nightly 0.6.18 mandatory.
+#  - fa3 does not JIT for 120a -> fa2 selection off-Hopper is correct here too.
+
+# ---- v1: NoPE sparse-MLA backend for capability 12 --------------------------
+# The only stock capability-12 sparse backend (FLASHINFER_MLA_SPARSE_SM120)
+# hard-requires the packed fp8_ds_mla layout (DeepSeek pe_dim=64); GLM-5.3 is
+# NoPE (qk_rope_head_dim=0) -> warmup assert. Extend the SM90 NoPE backend
+# (BatchMLAPagedAttentionWrapper) to major==12 with the FA2 path.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+base = Path("/usr/local/lib/python3.12/dist-packages/vllm")
+
+p = base / "platforms/cuda.py"
+s = p.read_text()
+old = """        elif device_capability.major == 12:
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+            ]"""
+new = """        elif device_capability.major == 12:
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+            ]"""
+if s.count(old) != 1:
+    raise SystemExit("unexpected cuda.py capability-12 MLA candidate list; refusing to patch")
+p.write_text(s.replace(old, new))
+
+p = base / "v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py"
+s = p.read_text()
+
+old = "    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:\n        return capability.major == 9\n"
+new = "    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:\n        return capability.major in (9, 12)\n"
+if s.count(old) != 1:
+    raise SystemExit("unexpected sm90 capability gate; refusing to patch")
+s = s.replace(old, new)
+
+old = '            backend="fa3",\n'
+new = '            backend=("fa3" if torch.cuda.get_device_capability()[0] == 9 else "fa2"),\n'
+if s.count(old) != 1:
+    raise SystemExit("unexpected sm90 wrapper backend literal; refusing to patch")
+s = s.replace(old, new)
+
+old = """        if not has_flashinfer_sm90_nope_mla():
+            return (
+                "FLASHINFER_MLA_SPARSE_SM90 requires FlashInfer with SM90 "
+                "MLA support (ckv_scale_arr in "
+                "BatchMLAPagedAttentionWrapper.run, FlashInfer >= 0.6.18)"
+            )"""
+new = """        if kv_cache_dtype in ("fp8", "fp8_e4m3") and not has_flashinfer_sm90_nope_mla():
+            return (
+                "FLASHINFER_MLA_SPARSE_SM90 fp8 KV requires FlashInfer with "
+                "SM90 MLA support (ckv_scale_arr in "
+                "BatchMLAPagedAttentionWrapper.run, FlashInfer >= 0.6.18)"
+            )"""
+if s.count(old) != 1:
+    raise SystemExit("unexpected sm90 flashinfer version gate; refusing to patch")
+s = s.replace(old, new)
+
+p.write_text(s)
+print("sm120 NoPE MLA patches applied")
+PY
+
+# ---- v2: env-gated NaN localizer (GLM53_NAN_DEBUG=1) ------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/model.py")
+s = p.read_text()
+
+hook_src = '''
+
+import os as _nan_os
+
+_NAN_SEEN: set = set()
+
+def _install_nan_hooks(model):
+    import torch as _t
+    from vllm.logger import init_logger as _il
+    _log = _il("glm53.nandebug")
+
+    def _mk(name):
+        def _hook(_mod, _inp, out):
+            def _chk(x):
+                if isinstance(x, _t.Tensor) and x.is_floating_point():
+                    bad = (~_t.isfinite(x.float())).sum().item()
+                    if bad and name not in _NAN_SEEN:
+                        _NAN_SEEN.add(name)
+                        _log.error("NANDEBUG first non-finite output in %s (%d bad / %d)", name, bad, x.numel())
+            if isinstance(out, tuple):
+                for o in out:
+                    _chk(o)
+            else:
+                _chk(out)
+        return _hook
+
+    for n, m in model.named_modules():
+        m.register_forward_hook(_mk(n))
+    _log.warning("NANDEBUG hooks installed on %d modules", sum(1 for _ in model.named_modules()))
+'''
+
+anchor = 'class Glm5NextMLP(nn.Module):'
+if s.count(anchor) != 1:
+    raise SystemExit("anchor not found")
+s = s.replace(anchor, hook_src + "\n\n" + anchor)
+
+init_anchor = '''class Glm5NextModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):'''
+if s.count(init_anchor) != 1:
+    raise SystemExit("init anchor not found")
+
+idx = s.index(init_anchor)
+nxt = s.index("\n    def ", idx + len(init_anchor))
+inject = '''
+        if _nan_os.environ.get("GLM53_NAN_DEBUG") == "1":
+            _install_nan_hooks(self)
+'''
+s = s[:nxt] + inject + s[nxt:]
+p.write_text(s)
+print("nan debug hooks injected")
+PY
+
+# ---- v3: FlashInfer 0.6.18 nightly (FA2 MLA NaN fix — on sm120 the 0.6.17
+# kernel NaNs on EVERY shape, probed). Drop the 0.6.17 AOT jit-cache so no
+# stale kernels load; everything JITs for 12.0a.
+RUN pip install -q --pre \
+      flashinfer-python==0.6.18.dev20260819 \
+      flashinfer-cubin==0.6.18.dev20260819 \
+      --extra-index-url https://flashinfer.ai/whl/nightly/ \
+    && pip uninstall -q -y flashinfer-jit-cache \
+    && python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__)"
+
+# ---- v4+v5: re-pin what the nightly sabotages (audit-verified on x86 too) ---
+RUN pip install -q nvidia-nccl-cu13==2.30.7 nvidia-cutlass-dsl==4.6.2 \
+    && pip show nvidia-nccl-cu13 | grep -q "Version: 2.30.7" \
+    && pip show nvidia-cutlass-dsl | grep -q "Version: 4.6.2" \
+    && echo PINS-RESTORED
+
+# ---- v6: PDL gated off on SM12x (unvalidated; races KDA state kernels) ------
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/usr/local/lib/python3.12/dist-packages/vllm/platforms/cuda.py")
+s = p.read_text()
+old = """    @classmethod
+    def is_arch_support_pdl(cls) -> bool:
+        try:
+            device = torch.cuda.current_device()
+            major, _ = torch.cuda.get_device_capability(device)
+        except Exception:
+            return False
+        return major >= 9
+"""
+new = """    @classmethod
+    def is_arch_support_pdl(cls) -> bool:
+        try:
+            device = torch.cuda.current_device()
+            major, _ = torch.cuda.get_device_capability(device)
+        except Exception:
+            return False
+        # PDL lowering is unvalidated on SM12x and races on KDA
+        # state kernels there; keep it to Hopper/Blackwell-datacenter.
+        return major in (9, 10)
+"""
+if s.count(old) != 1:
+    raise SystemExit("unexpected is_arch_support_pdl source; refusing to patch")
+p.write_text(s.replace(old, new))
+print("PDL gated off on SM12x")
+PY
+
+# ---- v7: indexer hardening (uninit top-k -> NaN lottery) --------------------
+COPY patch_v7.py /tmp/patch_v7.py
+RUN python3 /tmp/patch_v7.py && rm /tmp/patch_v7.py
+
+# ---- v8: fp8 KV cache for FA2 NoPE sparse-MLA on SM12x ----------------------
+COPY patch_v8_fp8.py /tmp/patch_v8_fp8.py
+RUN python3 /tmp/patch_v8_fp8.py && rm /tmp/patch_v8_fp8.py
