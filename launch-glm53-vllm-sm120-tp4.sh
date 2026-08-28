@@ -26,9 +26,10 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-glm53:sm120-v1}"
 NAME="vllm_glm53_sm120"
-MODEL="zai-org/GLM-5.3-Flash"
+SERVED="GLM-5.3-Flash"
+MODEL="zai-org/${SERVED}"
 CACHE_HOST_PATH="/var/tmp/glm53-sm120-vllm-cache"  # HF_HOME + all JIT/compile caches (vllm, flashinfer, tilelang, triton, inductor)
-PORT="${PORT:-11110}"
+PORT="${1:-11110}"
 GPUS="${GPUS:-0,1,2,3}"          # 4x RTX PRO 6000 (idle; 5,6 are 5090s, 4,7 spare Pros)
 MAX_LEN="${MAX_LEN:-262144}"     # pool 1,428,980 tokens w/ MTP-4 -> 5.45x full-context concurrency
 GMU="${GMU:-0.95}"
@@ -37,11 +38,10 @@ EAGER="${EAGER-}"  # CUDA graphs by default (10x decode); set EAGER=--enforce-ea
 MTP_DEFAULT='--speculative-config {"method":"mtp","num_speculative_tokens":4}'
 EXTRA_ARGS="${EXTRA_ARGS-$MTP_DEFAULT}"  # MTP-4 on by default; EXTRA_ARGS="" to disable
 
-#test -f "$SNAPSHOT/config.json"
 mkdir -p "$CACHE_HOST_PATH"
 docker rm -f "$NAME" 2>/dev/null || true
 
-docker run -d \
+docker run \
   --name "$NAME" --restart no \
   --gpus "\"device=$GPUS\"" \
   --ipc host --shm-size 64g \
@@ -60,15 +60,16 @@ docker run -d \
   "$IMAGE" \
     "$MODEL" \
     --kv-cache-memory=10934056960 \
-    --served-model-name glm-5.3-flash \
+    --served-model-name $SERVED \
     --host 0.0.0.0 --port "$PORT" \
     --trust-remote-code \
     --tensor-parallel-size 4 \
     --gpu-memory-utilization "$GMU" \
     --max-model-len "$MAX_LEN" \
-    --max-num-seqs 6 --block-size 2304 \
+    --max-num-seqs 6 \
+    --tool-call-parser glm47 \
     --kv-cache-dtype fp8_e4m3 \
-    --tool-call-parser glm47 --enable-auto-tool-choice \
+    --enable-auto-tool-choice \
     --reasoning-parser glm45 \
     --distributed-executor-backend mp \
     --load-format fastsafetensors \
@@ -77,12 +78,5 @@ docker run -d \
     --enable-chunked-prefill \
     --enable-prefix-caching \
     --enable-prompt-tokens-details \
-    --default-chat-template-kwargs '{"reasoning_effort":"high"}' \
+    --default-chat-template-kwargs '{"reasoning_effort":"max"}' \
     $EAGER $EXTRA_ARGS
-
-echo "launched $NAME gpus=$GPUS tp=4 max_len=$MAX_LEN gmu=$GMU p2p_disable=$P2P_DISABLE eager=[$EAGER]"
-sleep 2
-docker ps --format '{{.Names}} {{.Status}}' | grep "$NAME" || {
-  echo "$NAME exited; inspect with: docker logs $NAME" >&2
-  exit 1
-}
