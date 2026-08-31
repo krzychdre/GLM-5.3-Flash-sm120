@@ -22,6 +22,11 @@ Full port report with the bug-by-bug probe results: [docs/SM120-DEPLOY-REPORT.md
 
 ---
 
+# See the Best repo for RTX 6000 Pro runbooks (for many different models/quants):
+
+https://github.com/local-inference-lab/rtx6kpro/blob/master/models/glm-5.3-flash.md
+---
+
 # Original project: GLM-5.3-Flash on 2x NVIDIA DGX Spark
 
 Serving [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (320B total / 18B active MoE, released 2026-08-26) across two DGX Spark (GB10, SM121) nodes at tensor-parallel 2, using the [LibertAIDAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4) weight-only NVFP4 quant. **262,144-token context on TP2 — and up to the model-native 1,048,576 (1M) on TP4, whose 1.26M-token KV pool holds a full 1M-token request. Working, benchmarked, same-day as the model drop.**
